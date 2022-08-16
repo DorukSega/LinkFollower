@@ -1,17 +1,22 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+const core_1 = require("@octokit/core");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const node_process_1 = require("node:process");
 const undici_1 = require("undici");
 const ExListInput = "https://www.example.com\nexample.org"; //Example input
+const ExConfig = '{"telegram": { "bot_token": "HERE","chat_id": 1},"filters": ["REDACTED"]}';
 const LinkListPath = (0, node_path_1.join)(__dirname, process.argv.length > 2 ? process.argv[2] : "LinkList.txt"); //IF Given Enters Argument Else Defaults 
 const ChecksumListPath = (0, node_path_1.join)(__dirname, "ChecksumList.json");
 const HistoryPath = (0, node_path_1.join)(__dirname, "/history/");
 const DiffPath = (0, node_path_1.join)(__dirname, "/diff/"); //differences
+const interval = 10000;
+var Config;
 var ChecksumListRaw;
 var ChecksumList;
 var LinkList;
+var GistList = new Map();
 function parseLink(Link) {
     if (!Link.includes("http"))
         return "https://" + Link;
@@ -81,8 +86,23 @@ function writeDifferences(From, To, Link) {
     });
 }
 main();
-setInterval(main, 5000);
+setInterval(main, interval);
 function main() {
+    const configLocation = (0, node_path_1.join)(__dirname, "Config.json");
+    (0, node_fs_1.access)(configLocation, node_fs_1.constants.F_OK, err => {
+        if (err)
+            (0, node_fs_1.writeFile)(configLocation, ExConfig, err => {
+                if (err)
+                    throw err;
+            });
+        else {
+            (0, node_fs_1.readFile)(configLocation, 'utf8', (err, data) => {
+                if (err)
+                    throw err;
+                Config = JSON.parse(data);
+            });
+        }
+    });
     // Check IF the File Exists IF NOT Creates It
     (0, node_fs_1.access)(LinkListPath, node_fs_1.constants.F_OK, err => {
         if (err) { // does not exist
@@ -99,7 +119,7 @@ function main() {
     (0, node_fs_1.readFile)(LinkListPath, 'utf8', (err, data) => {
         if (err)
             throw err;
-        LinkList = data.split("\n");
+        LinkList = data.split("\n").filter(link => link);
         //console.log(LinkList);
         (0, node_fs_1.access)(ChecksumListPath, node_fs_1.constants.F_OK, err => {
             if (err)
@@ -127,6 +147,7 @@ function main() {
                                         ChecksumList.set(Link, RawHash);
                                         console.log(`New Change ${OldHash} -> ${RawHash} at ${Link}`);
                                         console.log("file:///" + DiffPath + escapeNegative(OldHash) + "_" + escapeNegative(RawHash));
+                                        doStuff(Link, OldHash, RawHash, RawData);
                                         writeChecksum();
                                     }
                                     else {
@@ -156,4 +177,59 @@ function writeChecksum() {
         if (err)
             throw err;
     });
+}
+function doStuff(Link, OldHash, RawHash, RawData) {
+    if (Config) {
+        if (Config.filters.length > 0)
+            Config.filters.forEach(filter => Link = Link.replace(filter, "REDACTED"));
+        const bot_message = `New Change ${OldHash} -> ${RawHash} at ${Link}`;
+        if (Config.telegram.bot_token && Config.telegram.chat_id) {
+            const link = 'https://api.telegram.org/bot' + Config.telegram.bot_token + '/sendMessage?chat_id=' + Config.telegram.chat_id + '&parse_mode=Markdown&text=' + bot_message;
+            (0, undici_1.request)(link, { method: "POST" }).then(res => {
+                //console.log(res.body)
+            });
+        }
+        if (Config.gist) {
+            const GistFile = (0, node_path_1.join)(__dirname, "GistList.json");
+            (0, node_fs_1.readFile)(GistFile, 'utf8', (err, data) => {
+                if (err)
+                    throw err;
+                let GistListRaw = JSON.parse(data);
+                GistList = new Map(GistListRaw.map(o => [o.link, o.id]));
+                const octokit = new core_1.Octokit({
+                    auth: Config.gist.personalAccessToken
+                });
+                if (GistList.has(Link)) {
+                    octokit.request('PATCH /gists/{gist_id}', {
+                        gist_id: GistList.get(Link) || "0",
+                        description: bot_message,
+                        files: {
+                            [`${escapeNegative(Hash(Link))}.txt`]: {
+                                content: RawData
+                            }
+                        }
+                    });
+                }
+                else {
+                    octokit.request('POST /gists', {
+                        description: bot_message,
+                        'public': true,
+                        files: {
+                            [`${escapeNegative(Hash(Link))}.txt`]: {
+                                content: RawData
+                            }
+                        }
+                    }).then(res => {
+                        if (res.data.id)
+                            GistList.set(Link, res.data.id);
+                        GistListRaw = Array.from(GistList, ([link, id]) => ({ link, id }));
+                        (0, node_fs_1.writeFile)(GistFile, JSON.stringify(GistListRaw), err => {
+                            if (err)
+                                throw err;
+                        });
+                    });
+                }
+            });
+        }
+    }
 }

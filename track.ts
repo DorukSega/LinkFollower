@@ -1,17 +1,36 @@
+import { Octokit } from "@octokit/core";
 import { access, constants, mkdir, readFile, writeFile } from 'node:fs';
 import { join } from 'node:path';
 import { exit } from 'node:process';
 import { request } from 'undici';
 const ExListInput = "https://www.example.com\nexample.org"; //Example input
-
+const ExConfig = '{"telegram": { "bot_token": "HERE","chat_id": 1},"filters": ["REDACTED"]}';
 const LinkListPath = join(__dirname, process.argv.length > 2 ? process.argv[2] : "LinkList.txt"); //IF Given Enters Argument Else Defaults 
 const ChecksumListPath = join(__dirname, "ChecksumList.json");
 const HistoryPath = join(__dirname, "/history/");
 const DiffPath = join(__dirname, "/diff/"); //differences
+const interval = 10000;
 
 interface ChecksumObject {
     link: string;
     checksum: number;
+}
+
+interface GistObject {
+    link: string;
+    id: string;
+}
+
+interface config {
+    telegram: {
+        bot_token: string,
+        chat_id: number
+    },
+    filters: Array<string>,
+    gist: {
+        accountName: string
+        personalAccessToken: string
+    },
 }
 
 interface LinkObject {
@@ -19,9 +38,11 @@ interface LinkObject {
     checksum: number;
 }
 
+var Config: config;
 var ChecksumListRaw: Array<ChecksumObject>;
 var ChecksumList: Map<string, number>;
 var LinkList: Array<string>;
+var GistList: Map<string, string> = new Map();
 
 function parseLink(Link: string): string {
     if (!Link.includes("http"))
@@ -98,9 +119,24 @@ function writeDifferences(From: LinkObject, To: LinkObject, Link: string) {
 
 
 main();
-setInterval(main, 5000);
+setInterval(main, interval);
 
 function main(): void {
+    const configLocation = join(__dirname, "Config.json");
+    access(configLocation, constants.F_OK, err => {
+        if (err)
+            writeFile(configLocation, ExConfig, err => { //writes the file with example string
+                if (err) throw err;
+            });
+        else {
+            readFile(configLocation, 'utf8', (err, data) => { //reads checksum list
+                if (err) throw err;
+                Config = JSON.parse(data);
+
+            });
+        }
+    });
+
     // Check IF the File Exists IF NOT Creates It
     access(LinkListPath, constants.F_OK, err => {
         if (err) { // does not exist
@@ -116,7 +152,7 @@ function main(): void {
 
     readFile(LinkListPath, 'utf8', (err, data) => {
         if (err) throw err;
-        LinkList = data.split("\n");
+        LinkList = data.split("\n").filter(link => link);
         //console.log(LinkList);
 
         access(ChecksumListPath, constants.F_OK, err => {
@@ -145,6 +181,7 @@ function main(): void {
                                         ChecksumList.set(Link, RawHash);
                                         console.log(`New Change ${OldHash} -> ${RawHash} at ${Link}`);
                                         console.log("file:///" + DiffPath + escapeNegative(OldHash) + "_" + escapeNegative(RawHash));
+                                        doStuff(Link, OldHash, RawHash, RawData);
                                         writeChecksum()
                                     } else {
                                         writeHistory({ checksum: RawHash, rawData: RawData }, Link);
@@ -176,4 +213,61 @@ function writeChecksum() {
     writeFile(ChecksumListPath, JSON.stringify(ChecksumListRaw), err => {
         if (err) throw err;
     });
+}
+
+function doStuff(Link: string, OldHash: number, RawHash: number, RawData: string) {
+    if (Config) {
+        if (Config.filters.length > 0)
+            Config.filters.forEach(filter => Link = Link.replace(filter, "REDACTED"));
+
+        const bot_message: string = `New Change ${OldHash} -> ${RawHash} at ${Link}`;
+        if (Config.telegram.bot_token && Config.telegram.chat_id) {
+            const link = 'https://api.telegram.org/bot' + Config.telegram.bot_token + '/sendMessage?chat_id=' + Config.telegram.chat_id + '&parse_mode=Markdown&text=' + bot_message
+            request(link, { method: "POST" }).then(res => {
+                //console.log(res.body)
+            })
+        }
+        if (Config.gist) {
+            const GistFile = join(__dirname, "GistList.json");
+            readFile(GistFile, 'utf8', (err, data) => { //reads checksum list
+                if (err) throw err;
+                let GistListRaw: Array<GistObject> = JSON.parse(data);
+                GistList = new Map(GistListRaw.map(o => [o.link, o.id]));
+                const octokit = new Octokit({
+                    auth: Config.gist.personalAccessToken
+                })
+                if (GistList.has(Link)) {
+                    octokit.request('PATCH /gists/{gist_id}', {
+                        gist_id: GistList.get(Link) || "0",
+                        description: bot_message,
+                        files: {
+                            [`${escapeNegative(Hash(Link))}.txt`]: {
+                                content: RawData
+                            }
+                        }
+                    })
+                } else {
+                    octokit.request('POST /gists', {
+                        description: bot_message,
+                        'public': true,
+                        files: {
+                            [`${escapeNegative(Hash(Link))}.txt`]: {
+                                content: RawData
+                            }
+                        }
+                    }).then(res => {
+                        if (res.data.id)
+                            GistList.set(Link, res.data.id);
+                        GistListRaw = Array.from(GistList, ([link, id]) => ({ link, id }));
+                        writeFile(GistFile, JSON.stringify(GistListRaw), err => {
+                            if (err) throw err;
+                        });
+                    })
+                }
+            })
+
+
+        }
+    }
+
 }
