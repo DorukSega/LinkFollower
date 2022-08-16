@@ -1,0 +1,7 @@
+node_modules/
+history/
+diff/
+LinkList.txt
+package.json
+package-lock.json
+ChecksumList.json
